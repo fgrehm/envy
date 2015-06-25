@@ -4,6 +4,11 @@ IFS="+" read USER ENV <<< "${USER:?}"
 ENV="${ENV:-$USER}"
 HOST_DATA="${HOST_DATA:?}"
 
+REPO=
+if [[ $ENV =~ '/' ]]; then
+  REPO="https://github.com/${ENV}.git"
+fi
+
 data-init() {
   mkdir -p /data/users
   cp /bin/envcmd /data/.envcmd
@@ -19,22 +24,37 @@ user-init() {
 }
 
 env-init() {
-  if [[ ! -d "/data/users/$USERS/envs/$ENV" ]]; then
-    cp -R /tmp/data/env "/data/users/$USER/envs/$ENV"
+  if [[ ! -d "/data/users/$USER/envs/$ENV" ]]; then
+    if [ -n "$REPO" ]; then
+      echo "Cloning GitHub project..."
+      git clone --depth 1 $REPO "/data/users/$USER/envs/$ENV"
+      if ! [ -f "/data/users/$USER/envs/$ENV/Dockerfile" ]; then
+        cp -R /tmp/data/env/Dockerfile.devstep "/data/users/$USER/envs/$ENV/Dockerfile"
+      fi
+    else
+      cp -R /tmp/data/env "/data/users/$USER/envs/$ENV"
+    fi
   fi
-  env-docker
+  # FIXME: This `if` should not exist, the reason why it is here is to avoid
+  #        having other things that are not the cloned project itself under that
+  #        directory
+  if [ -z "$REPO" ]; then
+    env-docker
+  fi
   cd "/data/users/$USER/envs/$ENV"
-  if ! docker history "$USER/$ENV" &> /dev/null; then
+  NAME="${USER}/$(echo $ENV | sed 's|/|.|g')"
+  if ! docker history "$NAME" &> /dev/null; then
     echo "Building environment ... "
-    docker build -t "$USER/$ENV" . &> /dev/null
+    docker build -t "$NAME" . #&> /dev/null
   fi
 }
 
 env-docker() {
   mkdir -p "/data/users/$USER/envs/$ENV/run"
-  if ! docker diff "$USER.$ENV" &> /dev/null; then
+  NAME="${USER}.$(echo $ENV | sed 's|/|.|g')"
+  if ! docker diff "$NAME" &> /dev/null; then
     docker run -d --privileged \
-      --name "$USER.$ENV" \
+      --name "$NAME" \
       --hostname "$ENV" \
       --env PORT=2375 \
       --restart always \
@@ -44,6 +64,17 @@ env-docker() {
 }
 
 env-session() {
+  IMAGE="${USER}/$(echo $ENV | sed 's|/|.|g')"
+  DOCKER_HOST_NAME="${USER}.$(echo $ENV | sed 's|/|.|g')"
+  NET=''
+  HOSTNAME=''
+  # FIXME: This `if` should not exist, the reason why it is here is to avoid
+  #        work around the current limitation that is in place which prevents
+  #        docker from being configured for Devstep environments
+  if [ -z "$REPO" ]; then
+    NET="--net \"container:$DOCKER_HOST_NAME\""
+    HOST="--env \"HOSTNAME=$ENV\""
+  fi
   local session="$USER.$(date +%s)"
   local status="128"
   set +e
@@ -52,7 +83,7 @@ env-session() {
       read cmd args <<< "$(cat /data/users/$USER/root/$session)"
       case "$cmd" in
       *rebuild)
-        docker build -t "$USER/$ENV" .
+        docker build -t "$IMAGE" .
         ;;
       *switch)
         echo "Switching to $args ... "
@@ -61,7 +92,7 @@ env-session() {
         ;;
       *commit)
         echo "Committing to $args ... "
-        docker commit "$session" "$USER/$ENV" > /dev/null
+        docker commit "$session" "$IMAGE" > /dev/null
         ;;
       esac
       rm -f "/data/users/$USER/root/$session"
@@ -69,8 +100,8 @@ env-session() {
     docker rm -f "$session" &> /dev/null
     docker run -it \
       --name "$session" \
-      --net "container:$USER.$ENV" \
-      --env "HOSTNAME=$ENV" \
+      $NET \
+      $HOST \
       --env "ENVY_SESSION=$session" \
       --env "ENVY_RANDOM=$RANDOM" \
       --env "DOCKER_HOST=unix:///env/run/docker.sock" \
@@ -82,7 +113,7 @@ env-session() {
       --volume "$HOST_DATA/users/$USER/root:/root" \
       --volume "$HOST_DATA/users/$USER/home:/home/$USER" \
       --volume "$HOST_DATA:/admin" \
-      "$USER/$ENV" $(docker-cmd)
+      "$IMAGE" $(docker-cmd)
     status=$?
   done
   docker rm -f "$session" > /dev/null
@@ -90,10 +121,11 @@ env-session() {
 }
 
 docker-cmd() {
-  if [[ "$(docker inspect -f {{.Config.Cmd}} $USER/$ENV)" != "<no value>" ]]; then
+  NAME="${USER}/$(echo $ENV | sed 's|/|.|g')"
+  if [[ "$(docker inspect -f {{.Config.Cmd}} $NAME)" != "<no value>" ]]; then
     return
   fi
-  if [[ "$(docker inspect -f {{.Config.Entrypoint}} $USER/$ENV)" != "<no value>" ]]; then
+  if [[ "$(docker inspect -f {{.Config.Entrypoint}} $NAME)" != "<no value>" ]]; then
     return
   fi
   echo "/bin/sh"
